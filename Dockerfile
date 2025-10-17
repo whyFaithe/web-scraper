@@ -47,6 +47,129 @@ function unauthorized(res){ return sendJSON(res, 401, {ok:false, error:"unauthor
 function isPrivateHost(h){ return [/^localhost$/i,/^127\./,/^\[?::1\]?$/, /^10\./,/^192\.168\./,/^172\.(1[6-9]|2\d|3[0-1])\./,/^169\.254\./].some(re=>re.test(h)); }
 function isValidHttpUrl(u){ try{ const x=new URL(u); return /^https?:$/.test(x.protocol) && !isPrivateHost(x.hostname); } catch { return false; } }
 
+// Extract Booking.com search results
+function extractBookingSearchResults(html, searchUrl){
+  const $ = cheerio.load(html);
+  const results = [];
+
+  // Find hotel cards in search results
+  $('div[data-testid="property-card"]').each((i, el) => {
+    const $card = $(el);
+    
+    // Get hotel title
+    const titleEl = $card.find('div[data-testid="title"]');
+    const title = titleEl.text().trim();
+    
+    // Get the actual hotel link
+    const linkEl = $card.find('a[data-testid="title-link"]');
+    const relativeUrl = linkEl.attr('href');
+    let hotelUrl = null;
+    if (relativeUrl) {
+      try {
+        hotelUrl = new URL(relativeUrl, 'https://www.booking.com').href;
+        // Clean up the URL - remove query params except essential ones
+        const urlObj = new URL(hotelUrl);
+        hotelUrl = urlObj.origin + urlObj.pathname;
+      } catch {}
+    }
+    
+    // Get rating score
+    const scoreEl = $card.find('div[data-testid="review-score"]');
+    const ratingText = scoreEl.find('div').first().text().trim();
+    const rating = ratingText ? parseFloat(ratingText) : null;
+    
+    // Get number of reviews
+    const reviewsEl = $card.find('div[data-testid="review-score"]');
+    const reviewsText = reviewsEl.text();
+    const reviewMatch = reviewsText.match(/(\d+(?:,\d+)?)\s*reviews?/i);
+    const reviews = reviewMatch ? parseInt(reviewMatch[1].replace(/,/g, '')) : null;
+    
+    // Get price if available
+    const priceEl = $card.find('span[data-testid="price-and-discounted-price"]');
+    const price = priceEl.text().trim();
+    
+    // Get location/address
+    const locationEl = $card.find('span[data-testid="address"]');
+    const location = locationEl.text().trim();
+
+    if (title) {
+      results.push({
+        title,
+        url: hotelUrl,
+        rating,
+        reviewCount: reviews,
+        price: price || null,
+        location: location || null
+      });
+    }
+  });
+
+  return {
+    searchUrl,
+    resultCount: results.length,
+    hotels: results
+  };
+}
+
+// Extract detailed hotel page data
+function extractBookingHotelDetails(html, url){
+  const $ = cheerio.load(html);
+  
+  const data = {
+    url,
+    title: null,
+    address: null,
+    phone: null,
+    rating: null,
+    reviewCount: null,
+    description: null,
+    amenities: [],
+    price: null
+  };
+
+  // Title
+  data.title = $('h2[data-testid="property-name"]').text().trim() || 
+               $('h1').first().text().trim();
+
+  // Address
+  data.address = $('span[data-node_tt_id="location_score_tooltip"]').text().trim() ||
+                 $('p[data-capla-component="b-property-web-property-page/PropertyHeaderAddress"]').text().trim();
+
+  // Rating
+  const ratingEl = $('div[data-testid="review-score-component"]');
+  const ratingText = ratingEl.find('div').first().text().trim();
+  data.rating = ratingText ? parseFloat(ratingText) : null;
+
+  // Review count
+  const reviewText = ratingEl.text();
+  const reviewMatch = reviewText.match(/(\d+(?:,\d+)?)\s*reviews?/i);
+  data.reviewCount = reviewMatch ? parseInt(reviewMatch[1].replace(/,/g, '')) : null;
+
+  // Description
+  data.description = $('p[data-testid="property-description"]').first().text().trim();
+
+  // Amenities
+  $('div[data-testid="property-most-popular-facilities"] div').each((i, el) => {
+    const amenity = $(el).text().trim();
+    if (amenity && amenity.length < 100) data.amenities.push(amenity);
+  });
+
+  // Phone - look in structured data
+  $('script[type="application/ld+json"]').each((i, el) => {
+    try {
+      const json = JSON.parse($(el).html());
+      if (json.telephone) data.phone = json.telephone;
+      if (json.address && !data.address) {
+        data.address = typeof json.address === 'string' ? 
+          json.address : 
+          JSON.stringify(json.address);
+      }
+    } catch {}
+  });
+
+  return data;
+}
+
 // Extract structured data from page
 function extractHotelData(html, url){
   const $ = cheerio.load(html);
@@ -123,6 +246,7 @@ async function handleScrape(qs, res){
 
   const timeoutMs = Math.min(30000, Math.max(5000, parseInt(qs.get("timeout") || "15000", 10)));
   const includeHtml = (qs.get("html") || "0") === "1";
+  const mode = (qs.get("mode") || "auto").toLowerCase(); // "auto" | "search" | "details"
 
   let context, page;
   try{
@@ -143,7 +267,28 @@ async function handleScrape(qs, res){
     await page.waitForTimeout(2000);
 
     const html = await page.content();
-    const data = extractHotelData(html, target);
+    let data;
+
+    // Detect if it's a Booking.com URL and what type
+    const isBooking = target.includes('booking.com');
+    const isSearchPage = target.includes('/searchresults.') || target.includes('ss=');
+    const isHotelPage = target.includes('/hotel/');
+
+    if (mode === "auto") {
+      if (isBooking && isSearchPage) {
+        data = extractBookingSearchResults(html, target);
+      } else if (isBooking && isHotelPage) {
+        data = extractBookingHotelDetails(html, target);
+      } else {
+        data = extractHotelData(html, target);
+      }
+    } else if (mode === "search") {
+      data = extractBookingSearchResults(html, target);
+    } else if (mode === "details") {
+      data = extractBookingHotelDetails(html, target);
+    } else {
+      data = extractHotelData(html, target);
+    }
 
     const result = {
       ok: true,
