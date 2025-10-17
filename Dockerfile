@@ -1,4 +1,4 @@
-# ----- Hotel Data Scraper Service -----
+# ----- Hotel Data Scraper Service (bot-resilient) -----
 FROM mcr.microsoft.com/playwright:v1.47.0-jammy
 
 ENV DEBIAN_FRONTEND=noninteractive
@@ -9,11 +9,14 @@ ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
 WORKDIR /app
 
+# keep image slim; we only need certs
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
+# provide playwright + cheerio so require('playwright') works at runtime
 RUN npm init -y && npm install --omit=dev playwright@1.47.0 cheerio@1.0.0-rc.12
 
+# ------------ server ------------
 RUN cat > /app/server.js <<'EOF'
 const http = require("http");
 const { chromium } = require("playwright");
@@ -22,6 +25,7 @@ const cheerio = require("cheerio");
 const PORT = process.env.PORT || 10000;
 const API_KEY = process.env.API_KEY || "";
 
+/* ----------------- Browser factory (reused) ----------------- */
 let browserPromise;
 async function getBrowser(){
   if (!browserPromise){
@@ -31,13 +35,15 @@ async function getBrowser(){
         "--no-sandbox",
         "--disable-setuid-sandbox",
         "--disable-dev-shm-usage",
-        "--disable-gpu"
+        "--disable-gpu",
+        "--disable-features=IsolateOrigins,site-per-process"
       ]
     });
   }
   return browserPromise;
 }
 
+/* ----------------- HTTP helpers ----------------- */
 function sendJSON(res, code, obj){
   const body = Buffer.from(JSON.stringify(obj, null, 2));
   res.writeHead(code, {"content-type":"application/json; charset=utf-8","content-length":body.length});
@@ -47,74 +53,219 @@ function unauthorized(res){ return sendJSON(res, 401, {ok:false, error:"unauthor
 function isPrivateHost(h){ return [/^localhost$/i,/^127\./,/^\[?::1\]?$/, /^10\./,/^192\.168\./,/^172\.(1[6-9]|2\d|3[0-1])\./,/^169\.254\./].some(re=>re.test(h)); }
 function isValidHttpUrl(u){ try{ const x=new URL(u); return /^https?:$/.test(x.protocol) && !isPrivateHost(x.hostname); } catch { return false; } }
 
-// Extract Booking.com search results
+/* ----------------- Light stealth / real headers ----------------- */
+const DESKTOP_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
+const ANDROID_UA = "Mozilla/5.0 (Linux; Android 14; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36";
+const IPHONE_UA  = "Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1";
+
+async function applyStealth(page){
+  await page.addInitScript(() => {
+    Object.defineProperty(navigator, "webdriver", {get: () => false});
+    window.chrome = window.chrome || { runtime: {} };
+    const origQuery = window.navigator.permissions?.query;
+    if (origQuery) {
+      window.navigator.permissions.query = (p) =>
+        p && p.name === "notifications"
+          ? Promise.resolve({ state: Notification.permission })
+          : origQuery(p);
+    }
+    Object.defineProperty(navigator, "plugins",   { get: () => [1,2,3] });
+    Object.defineProperty(navigator, "languages", { get: () => ["en-US","en"] });
+  });
+}
+
+/* ----------------- Context factory ----------------- */
+async function makeContext({
+  ua = ANDROID_UA,
+  lang = "en-US,en;q=0.9",
+  w = 1200,
+  h = 800,
+  blockAssets = true
+} = {}){
+  const ctx = await (await getBrowser()).newContext({
+    viewport: { width: w, height: h },
+    userAgent: ua,
+    locale: (lang.split(",")[0] || "en-US"),
+    deviceScaleFactor: 1,
+    bypassCSP: true,
+    ignoreHTTPSErrors: true,
+    javaScriptEnabled: true,
+    // Service workers sometimes interfere with token flows; block them.
+    serviceWorkers: "block",
+    extraHTTPHeaders: {
+      "Accept-Language": lang,
+      "Upgrade-Insecure-Requests": "1",
+      "Sec-Fetch-Site": "none",
+      "Sec-Fetch-Mode": "navigate",
+      "Sec-Fetch-User": "?1",
+      "Sec-Fetch-Dest": "document"
+    }
+  });
+
+  if (blockAssets){
+    await ctx.route("**/*", route => {
+      const r = route.request();
+      const type = r.resourceType();
+      if (type === "image" || type === "font" || type === "media") return route.abort();
+      return route.continue();
+    });
+  }
+
+  return ctx;
+}
+
+/* ----------------- Booking-specific loader ----------------- */
+/** Returns { ok, finalUrl, html, attempts, challengeDetected } */
+async function loadBookingPage(targetUrl, { timeoutMs = 28000 } = {}){
+  // Try Android Chrome first, then iPhone Safari. These often see lighter bot friction.
+  const attempts = [
+    { ua: ANDROID_UA, wait: "domcontentloaded" },
+    { ua: IPHONE_UA,  wait: "load" }
+  ];
+
+  for (let i = 0; i < attempts.length; i++){
+    const { ua, wait } = attempts[i];
+    let ctx, page, challengeDetected = false;
+    try{
+      ctx = await makeContext({ ua, blockAssets: false }); // allow JS/CSS
+      page = await ctx.newPage();
+      await applyStealth(page);
+
+      // 1) Warm homepage to set basic cookies (lang etc.)
+      await page.goto("https://www.booking.com/?lang=en-us", { waitUntil: "domcontentloaded", timeout: Math.min(8000, timeoutMs) }).catch(()=>{});
+
+      // 2) Go to the target search URL
+      await page.goto(targetUrl, { waitUntil: wait, timeout: timeoutMs });
+
+      // If AWS WAF challenge is present, allow it to complete (it usually auto-redirects)
+      const sawChallenge = await page.locator('script[src*="__challenge"], script:has-text("AwsWafIntegration")').first().isVisible({ timeout: 1000 }).catch(()=>false);
+      if (sawChallenge) {
+        challengeDetected = true;
+        // wait for URL change or results present
+        const prev = page.url();
+        await Promise.race([
+          page.waitForURL((u) => u !== prev, { timeout: 12000 }).catch(()=>{}),
+          page.waitForSelector('div[data-testid="property-card"]', { timeout: 12000 }).catch(()=>{})
+        ]);
+      }
+
+      // Handle OneTrust cookie banner quickly (Accept all)
+      const oneTrustAccept = page.locator('#onetrust-accept-btn-handler, button:has-text("Accept")').first();
+      if (await oneTrustAccept.isVisible({ timeout: 1000 }).catch(()=>false)) {
+        await oneTrustAccept.click({ timeout: 2000 }).catch(()=>{});
+        await page.waitForTimeout(400);
+      }
+
+      // Wait for search results to render
+      await page.waitForSelector('div[data-testid="property-card"], #search_results_table, [aria-label="Search results"]', { timeout: 12000 });
+
+      // Small scroll to trigger lazy cards
+      await page.evaluate(() => { window.scrollBy(0, 1200); });
+      await page.waitForTimeout(600);
+
+      // Gather HTML
+      const html = await page.content();
+      const finalUrl = page.url();
+      const looksOk =
+        /data-testid="property-card"/i.test(html) ||
+        /id="search_results_table"/i.test(html) ||
+        /aria-label="Search results"/i.test(html);
+
+      if (looksOk) {
+        return { ok: true, finalUrl, html, attempts: i+1, challengeDetected };
+      }
+
+      // If not ok, try next UA
+      await page.close().catch(()=>{});
+      await ctx.close().catch(()=>{});
+    } catch (e){
+      // try the next attempt
+      try { if (page) await page.close(); } catch {}
+      try { if (ctx) await ctx.close(); } catch {}
+      if (i === attempts.length - 1) {
+        return { ok: false, finalUrl: targetUrl, html: "", attempts: i+1, challengeDetected: false, error: String(e) };
+      }
+    }
+  }
+
+  // If we fall through (shouldn't), return not ok
+  return { ok: false, finalUrl: targetUrl, html: "", attempts: attempts.length, challengeDetected: false };
+}
+
+/* ----------------- Generic loader (non-Booking) ----------------- */
+async function loadGeneric(targetUrl, { timeoutMs = 20000 } = {}){
+  let ctx, page;
+  try{
+    ctx = await makeContext({ ua: DESKTOP_UA });
+    page = await ctx.newPage();
+    await applyStealth(page);
+
+    await page.goto(targetUrl, { waitUntil: "domcontentloaded", timeout: timeoutMs });
+    await page.waitForTimeout(800);
+    await page.waitForLoadState("networkidle", { timeout: 8000 }).catch(()=>{});
+    const html = await page.content();
+    const finalUrl = page.url();
+    return { ok: true, finalUrl, html };
+  } catch (e){
+    return { ok: false, finalUrl: targetUrl, html: "", error: String(e) };
+  } finally {
+    try { if (page) await page.close(); } catch {}
+    try { if (ctx) await ctx.close(); } catch {}
+  }
+}
+
+/* ----------------- Extractors ----------------- */
 function extractBookingSearchResults(html, searchUrl){
   const $ = cheerio.load(html);
   const results = [];
 
-  // Find hotel cards in search results
   $('div[data-testid="property-card"]').each((i, el) => {
     const $card = $(el);
-    
-    // Get hotel title
-    const titleEl = $card.find('div[data-testid="title"]');
-    const title = titleEl.text().trim();
-    
-    // Get the actual hotel link
-    const linkEl = $card.find('a[data-testid="title-link"]');
-    const relativeUrl = linkEl.attr('href');
+
+    const title = $card.find('div[data-testid="title"]').text().trim()
+      || $card.find('[data-testid="property-card-name"]').text().trim();
+
+    // hotel URL
+    const rel = $card.find('a[data-testid="title-link"]').attr('href')
+      || $card.find('a[data-testid="availability-cta"]').attr('href');
     let hotelUrl = null;
-    if (relativeUrl) {
+    if (rel) {
       try {
-        hotelUrl = new URL(relativeUrl, 'https://www.booking.com').href;
-        // Clean up the URL - remove query params except essential ones
-        const urlObj = new URL(hotelUrl);
-        hotelUrl = urlObj.origin + urlObj.pathname;
+        const abs = new URL(rel, 'https://www.booking.com').href;
+        const u = new URL(abs);
+        hotelUrl = u.origin + u.pathname; // strip params
       } catch {}
     }
-    
-    // Get rating score
-    const scoreEl = $card.find('div[data-testid="review-score"]');
-    const ratingText = scoreEl.find('div').first().text().trim();
-    const rating = ratingText ? parseFloat(ratingText) : null;
-    
-    // Get number of reviews
-    const reviewsEl = $card.find('div[data-testid="review-score"]');
-    const reviewsText = reviewsEl.text();
-    const reviewMatch = reviewsText.match(/(\d+(?:,\d+)?)\s*reviews?/i);
-    const reviews = reviewMatch ? parseInt(reviewMatch[1].replace(/,/g, '')) : null;
-    
-    // Get price if available
-    const priceEl = $card.find('span[data-testid="price-and-discounted-price"]');
-    const price = priceEl.text().trim();
-    
-    // Get location/address
-    const locationEl = $card.find('span[data-testid="address"]');
-    const location = locationEl.text().trim();
+
+    // rating
+    let rating = null;
+    const scoreNode = $card.find('[data-testid="review-score"] [aria-label], [data-testid="review-score"] div').first();
+    const scoreTxt = (scoreNode.attr('aria-label') || scoreNode.text() || "").trim();
+    const mScore = scoreTxt.match(/([0-9]+(?:\.[0-9])?)/);
+    if (mScore) rating = parseFloat(mScore[1]);
+
+    // reviews
+    let reviewCount = null;
+    const reviewsTxt = $card.find('[data-testid="review-score"]').text();
+    const mReviews = reviewsTxt.match(/([\d,]+)\s+reviews?/i);
+    if (mReviews) reviewCount = parseInt(mReviews[1].replace(/,/g, ''), 10);
+
+    // price (if visible)
+    const price = $card.find('span[data-testid="price-and-discounted-price"]').text().trim() ||
+                  $card.find('[data-testid="price-for-x-nights"]').text().trim() || null;
+
+    const location = $card.find('span[data-testid="address"]').text().trim() || null;
 
     if (title) {
-      results.push({
-        title,
-        url: hotelUrl,
-        rating,
-        reviewCount: reviews,
-        price: price || null,
-        location: location || null
-      });
+      results.push({ title, url: hotelUrl, rating, reviewCount, price: price || null, location });
     }
   });
 
-  return {
-    searchUrl,
-    resultCount: results.length,
-    hotels: results
-  };
+  return { searchUrl, resultCount: results.length, hotels: results };
 }
 
-// Extract detailed hotel page data
 function extractBookingHotelDetails(html, url){
   const $ = cheerio.load(html);
-  
   const data = {
     url,
     title: null,
@@ -127,42 +278,41 @@ function extractBookingHotelDetails(html, url){
     price: null
   };
 
-  // Title
-  data.title = $('h2[data-testid="property-name"]').text().trim() || 
-               $('h1').first().text().trim();
+  data.title =
+    $('h2[data-testid="property-name"]').text().trim() ||
+    $('h1').first().text().trim() ||
+    $('title').text().trim() || null;
 
-  // Address
-  data.address = $('span[data-node_tt_id="location_score_tooltip"]').text().trim() ||
-                 $('p[data-capla-component="b-property-web-property-page/PropertyHeaderAddress"]').text().trim();
+  data.address =
+    $('span[data-node_tt_id="location_score_tooltip"]').text().trim() ||
+    $('[data-testid="address"]').text().trim() ||
+    $('p[data-capla-component="b-property-web-property-page/PropertyHeaderAddress"]').text().trim() || null;
 
-  // Rating
-  const ratingEl = $('div[data-testid="review-score-component"]');
-  const ratingText = ratingEl.find('div').first().text().trim();
-  data.rating = ratingText ? parseFloat(ratingText) : null;
+  // rating + reviews
+  const scoreWrap = $('[data-testid="review-score-component"], [data-testid="review-score"]');
+  const scoreTxt = scoreWrap.find('div').first().text().trim();
+  const mScore = scoreTxt.match(/([0-9]+(?:\.[0-9])?)/);
+  if (mScore) data.rating = parseFloat(mScore[1]);
 
-  // Review count
-  const reviewText = ratingEl.text();
-  const reviewMatch = reviewText.match(/(\d+(?:,\d+)?)\s*reviews?/i);
-  data.reviewCount = reviewMatch ? parseInt(reviewMatch[1].replace(/,/g, '')) : null;
+  const reviewTxt = scoreWrap.text();
+  const mReviews = reviewTxt.match(/([\d,]+)\s+reviews?/i);
+  if (mReviews) data.reviewCount = parseInt(mReviews[1].replace(/,/g,''),10);
 
-  // Description
-  data.description = $('p[data-testid="property-description"]').first().text().trim();
+  data.description = $('p[data-testid="property-description"]').first().text().trim() || null;
 
-  // Amenities
-  $('div[data-testid="property-most-popular-facilities"] div').each((i, el) => {
-    const amenity = $(el).text().trim();
-    if (amenity && amenity.length < 100) data.amenities.push(amenity);
+  $('[data-testid="property-most-popular-facilities"] [data-testid="facility-card"]').each((i, el) => {
+    const t = cheerio(el).text().trim();
+    if (t && t.length < 100) data.amenities.push(t);
   });
 
-  // Phone - look in structured data
+  // structured data
   $('script[type="application/ld+json"]').each((i, el) => {
     try {
       const json = JSON.parse($(el).html());
-      if (json.telephone) data.phone = json.telephone;
+      if (json.telephone && !data.phone) data.phone = json.telephone;
       if (json.address && !data.address) {
-        data.address = typeof json.address === 'string' ? 
-          json.address : 
-          JSON.stringify(json.address);
+        if (typeof json.address === "string") data.address = json.address;
+        else data.address = [json.address.streetAddress, json.address.addressLocality, json.address.addressRegion, json.address.postalCode].filter(Boolean).join(", ");
       }
     } catch {}
   });
@@ -170,12 +320,11 @@ function extractBookingHotelDetails(html, url){
   return data;
 }
 
-// Extract structured data from page
-function extractHotelData(html, url){
+function extractGenericHotelData(html, url){
   const $ = cheerio.load(html);
   const data = {
     url,
-    title: null,
+    title: $('title').text().trim() || $('h1').first().text().trim() || null,
     address: null,
     phone: null,
     email: null,
@@ -183,135 +332,105 @@ function extractHotelData(html, url){
     structuredData: []
   };
 
-  // Get title
-  data.title = $('title').text().trim() || $('h1').first().text().trim();
-
-  // Look for JSON-LD structured data (most reliable)
   $('script[type="application/ld+json"]').each((i, el) => {
     try {
       const json = JSON.parse($(el).html());
       data.structuredData.push(json);
-      
-      // Extract from structured data
-      if (json['@type'] === 'Hotel' || json['@type'] === 'LodgingBusiness'){
-        if (json.address) data.address = json.address.streetAddress || JSON.stringify(json.address);
-        if (json.telephone) data.phone = json.telephone;
-        if (json.email) data.email = json.email;
+      const t = Array.isArray(json) ? json : [json];
+      for (const item of t) {
+        if (item['@type'] === 'Hotel' || item['@type'] === 'LodgingBusiness') {
+          if (item.address) {
+            if (typeof item.address === "string") data.address = item.address;
+            else data.address = [item.address.streetAddress, item.address.addressLocality, item.address.addressRegion, item.address.postalCode].filter(Boolean).join(", ");
+          }
+          if (item.telephone) data.phone = item.telephone;
+          if (item.email) data.email = item.email;
+        }
       }
     } catch {}
   });
 
-  // Look for common booking platform links
-  const bookingDomains = ['booking.com', 'expedia.com', 'hotels.com', 'tripadvisor.com', 'airbnb.com', 'vrbo.com', 'agoda.com'];
+  const bookingDomains = ['booking.com','expedia.com','hotels.com','tripadvisor.com','airbnb.com','vrbo.com','agoda.com','kayak.com','priceline.com'];
   $('a[href]').each((i, el) => {
     const href = $(el).attr('href');
     if (href && bookingDomains.some(d => href.includes(d))){
-      const fullUrl = new URL(href, url).href;
-      if (!data.bookingLinks.includes(fullUrl)){
-        data.bookingLinks.push(fullUrl);
-      }
+      try {
+        const full = new URL(href, url).href;
+        if (!data.bookingLinks.includes(full)) data.bookingLinks.push(full);
+      } catch {}
     }
   });
 
-  // Fallback: look for address patterns
+  const bodyText = $('body').text();
   if (!data.address){
-    const text = $('body').text();
-    const addressRegex = /\d+\s+[\w\s]+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Court|Ct|Plaza|Parkway|Pkwy)[,\s]+[\w\s]+,\s*[A-Z]{2}\s+\d{5}/gi;
-    const match = text.match(addressRegex);
-    if (match) data.address = match[0].trim();
+    const m = bodyText.match(/\d+\s+[^\n,]+(?:Street|St|Avenue|Ave|Road|Rd|Boulevard|Blvd|Drive|Dr|Lane|Ln|Way|Court|Ct|Plaza|Parkway|Pkwy)[^\n,]*,\s*[A-Za-z .'-]+,\s*[A-Z]{2}\s+\d{5}/);
+    if (m) data.address = m[0].trim();
   }
-
-  // Fallback: look for phone patterns
   if (!data.phone){
-    const text = $('body').text();
-    const phoneRegex = /(?:\+?1[-.\s]?)?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})/g;
-    const match = text.match(phoneRegex);
-    if (match) data.phone = match[0].trim();
+    const m = bodyText.match(/(?:\+?1[-.\s]?)?\(?([0-9]{3})\)?[-.\s]?([0-9]{3})[-.\s]?([0-9]{4})/);
+    if (m) data.phone = m[0].trim();
   }
-
-  // Look for email
   if (!data.email){
-    const text = $('body').text();
-    const emailRegex = /[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g;
-    const match = text.match(emailRegex);
-    if (match) data.email = match[0].trim();
+    const m = bodyText.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/);
+    if (m) data.email = m[0].trim();
   }
 
   return data;
 }
 
+/* ----------------- Handler ----------------- */
 async function handleScrape(qs, res){
   const target = (qs.get("url") || "").trim();
   if (!target || !isValidHttpUrl(target)) return sendJSON(res, 400, {ok:false, error:"invalid url"});
 
-  const timeoutMs = Math.min(30000, Math.max(5000, parseInt(qs.get("timeout") || "15000", 10)));
+  const timeoutMs   = Math.min(40000, Math.max(6000, parseInt(qs.get("timeout") || "28000", 10)));
   const includeHtml = (qs.get("html") || "0") === "1";
-  const mode = (qs.get("mode") || "auto").toLowerCase(); // "auto" | "search" | "details"
+  const mode        = (qs.get("mode") || "auto").toLowerCase(); // "auto" | "search" | "details"
 
-  let context, page;
-  try{
-    const browser = await getBrowser();
-    context = await browser.newContext({
-      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-      viewport: { width: 1920, height: 1080 }
-    });
+  let finalLoad;
+  const isBooking = /(^|\.)booking\.com$/i.test(new URL(target).hostname);
 
-    page = await context.newPage();
-    
-    await page.goto(target, { 
-      waitUntil: "domcontentloaded", 
-      timeout: timeoutMs 
-    });
-
-    // Wait a bit for dynamic content
-    await page.waitForTimeout(2000);
-
-    const html = await page.content();
-    let data;
-
-    // Detect if it's a Booking.com URL and what type
-    const isBooking = target.includes('booking.com');
-    const isSearchPage = target.includes('/searchresults.') || target.includes('ss=');
-    const isHotelPage = target.includes('/hotel/');
-
-    if (mode === "auto") {
-      if (isBooking && isSearchPage) {
-        data = extractBookingSearchResults(html, target);
-      } else if (isBooking && isHotelPage) {
-        data = extractBookingHotelDetails(html, target);
-      } else {
-        data = extractHotelData(html, target);
-      }
-    } else if (mode === "search") {
-      data = extractBookingSearchResults(html, target);
-    } else if (mode === "details") {
-      data = extractBookingHotelDetails(html, target);
-    } else {
-      data = extractHotelData(html, target);
-    }
-
-    const result = {
-      ok: true,
-      ...data
-    };
-
-    if (includeHtml) result.html = html;
-
-    return sendJSON(res, 200, result);
-
-  } catch (e){
-    console.error("scrape error:", e);
-    return sendJSON(res, 500, { ok:false, error: String(e), url: target });
-  } finally {
-    try { if (page) await page.close(); } catch {}
-    try { if (context) await context.close(); } catch {}
+  if (isBooking) {
+    finalLoad = await loadBookingPage(target, { timeoutMs });
+  } else {
+    finalLoad = await loadGeneric(target, { timeoutMs });
   }
+
+  if (!finalLoad.ok) {
+    return sendJSON(res, 502, { ok:false, error: finalLoad.error || "load failed", finalUrl: finalLoad.finalUrl, attempts: finalLoad.attempts || 1 });
+  }
+
+  const html = finalLoad.html || "";
+  const finalUrl = finalLoad.finalUrl || target;
+
+  // Choose extractor
+  let data;
+  if (mode === "search" || (mode === "auto" && isBooking && /\/searchresults\.html/.test(finalUrl))) {
+    data = extractBookingSearchResults(html, finalUrl);
+  } else if (mode === "details" || (mode === "auto" && isBooking && /\/hotel\//.test(finalUrl))) {
+    data = extractBookingHotelDetails(html, finalUrl);
+  } else {
+    data = extractGenericHotelData(html, finalUrl);
+  }
+
+  const out = {
+    ok: true,
+    finalUrl,
+    attempts: finalLoad.attempts || 1,
+    challengeDetected: !!finalLoad.challengeDetected,
+    ...data
+  };
+  if (includeHtml) out.html = html;
+
+  return sendJSON(res, 200, out);
 }
 
+/* ----------------- HTTP server ----------------- */
 const server = http.createServer(async (req, res) => {
   try{
     const url = new URL(req.url, `http://${req.headers.host}`);
 
+    // optional API key
     if (API_KEY){
       const key = req.headers["x-api-key"];
       if (key !== API_KEY) return unauthorized(res);
@@ -334,10 +453,7 @@ EOF
 
 EXPOSE 10000
 
-HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
-  CMD node -e "fetch('http://127.0.0.1:'+process.env.PORT+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
-
-CMD ["node","/app/server.js"]
+# healthcheck
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s \
   CMD node -e "fetch('http://127.0.0.1:'+process.env.PORT+'/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
 
